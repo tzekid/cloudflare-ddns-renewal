@@ -2,6 +2,8 @@
 
 Cloudflare DDNS Renewal is a lightweight Go-based tool for automatically updating Cloudflare DNS A records (including wildcard records) with your current public IP address. This is especially useful for dynamic IP setups where your IP may change periodically.
 
+I personally have this running in a 30 second daemon on my server to ensure that my DNS records are always up-to-date. The tool also supports Telegram notifications for successful updates.
+
 ## Features
 
 - **Automatic IP detection:** Retrieves your current public IP address.
@@ -25,4 +27,3 @@ Clone the repository and build the binary:
 git clone https://github.com/yourusername/cloudflare-ddns-renewal.git
 cd cloudflare-ddns-renewal
 go build -trimpath -ldflags="-s -w" -o cloudflare-ddns-renewal .
-
