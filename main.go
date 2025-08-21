@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,11 +75,52 @@ func updateDomain(ctx context.Context, api *cloudflare.API, currentIP, domain st
 		wildcardRec = &wildcardRecords[0]
 	}
 
-	if rootRec == nil {
-		return fmt.Errorf("A record for %s not found", rootName)
+	// Determine defaults for new records
+	ttl := 300
+	if ttlEnv := os.Getenv("TTL"); ttlEnv != "" {
+		if v, err := strconv.Atoi(ttlEnv); err == nil && v >= 60 && v <= 86400 { // Cloudflare acceptable range
+			ttl = v
+		}
 	}
+	proxied := true
+	if pEnv := os.Getenv("PROXIED"); pEnv != "" {
+		switch strings.ToLower(pEnv) {
+		case "false", "0", "no", "off":
+			proxied = false
+		}
+	}
+
+	// Auto-create missing root record
+	if rootRec == nil {
+		fmt.Printf("Creating missing A record %s -> %s (ttl=%d proxied=%v)\n", rootName, currentIP, ttl, proxied)
+		created, err := api.CreateDNSRecord(ctx, rc, cloudflare.CreateDNSRecordParams{
+			Type:    "A",
+			Name:    rootName,
+			Content: currentIP,
+			TTL:     ttl,
+			Proxied: &proxied,
+		})
+		if err != nil {
+			return fmt.Errorf("failed creating A record %s: %w", rootName, err)
+		}
+		rootRec = &created
+		sendTelegramMessage(fmt.Sprintf("Created A record %s -> %s", rootName, currentIP))
+	}
+	// Auto-create missing wildcard record
 	if wildcardRec == nil {
-		return fmt.Errorf("A record for %s not found", wildcardName)
+		fmt.Printf("Creating missing A record %s -> %s (ttl=%d proxied=%v)\n", wildcardName, currentIP, ttl, proxied)
+		created, err := api.CreateDNSRecord(ctx, rc, cloudflare.CreateDNSRecordParams{
+			Type:    "A",
+			Name:    wildcardName,
+			Content: currentIP,
+			TTL:     ttl,
+			Proxied: &proxied,
+		})
+		if err != nil {
+			return fmt.Errorf("failed creating A record %s: %w", wildcardName, err)
+		}
+		wildcardRec = &created
+		sendTelegramMessage(fmt.Sprintf("Created A record %s -> %s", wildcardName, currentIP))
 	}
 
 	// Update root record if needed
