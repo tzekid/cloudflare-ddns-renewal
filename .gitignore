@@ -9,6 +9,7 @@
 
 # Compiled binary for Go
 cloudflare-ddns-renewal
+cloudflare-ddns-renewal.env
 
 # Output of the go build command
 /build/

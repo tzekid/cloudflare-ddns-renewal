@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/cloudflare/cloudflare-go"
 )
@@ -41,14 +42,121 @@ func sendTelegramMessage(message string) {
 	// Optionally, you can check resp.StatusCode or inspect the response body.
 }
 
+// updateDomain updates the root A record and its wildcard for a single domain.
+func updateDomain(ctx context.Context, api *cloudflare.API, currentIP, domain string) error {
+	start := time.Now()
+	zoneID, err := api.ZoneIDByName(domain)
+	if err != nil {
+		return fmt.Errorf("failed to get zone ID for %s: %w", domain, err)
+	}
+	rc := &cloudflare.ResourceContainer{Identifier: zoneID, Type: "zone"}
+
+	rootName := domain
+	wildcardName := "*." + domain
+
+	// Fetch existing root record
+	rootRecords, _, err := api.ListDNSRecords(ctx, rc, cloudflare.ListDNSRecordsParams{Type: "A", Name: rootName})
+	if err != nil {
+		return fmt.Errorf("error listing root record for %s: %w", domain, err)
+	}
+	var rootRec *cloudflare.DNSRecord
+	if len(rootRecords) > 0 {
+		rootRec = &rootRecords[0]
+	}
+
+	// Fetch existing wildcard record
+	wildcardRecords, _, err := api.ListDNSRecords(ctx, rc, cloudflare.ListDNSRecordsParams{Type: "A", Name: wildcardName})
+	if err != nil {
+		return fmt.Errorf("error listing wildcard record for %s: %w", domain, err)
+	}
+	var wildcardRec *cloudflare.DNSRecord
+	if len(wildcardRecords) > 0 {
+		wildcardRec = &wildcardRecords[0]
+	}
+
+	if rootRec == nil {
+		return fmt.Errorf("A record for %s not found", rootName)
+	}
+	if wildcardRec == nil {
+		return fmt.Errorf("A record for %s not found", wildcardName)
+	}
+
+	// Update root record if needed
+	if rootRec.Content == currentIP {
+		fmt.Printf("%s already up to date (%s)\n", rootName, currentIP)
+	} else {
+		fmt.Printf("Updating %s from %s to %s\n", rootName, rootRec.Content, currentIP)
+		_, err = api.UpdateDNSRecord(ctx, rc, cloudflare.UpdateDNSRecordParams{
+			ID:      rootRec.ID,
+			Type:    "A",
+			Name:    rootName,
+			Content: currentIP,
+			TTL:     rootRec.TTL,
+			Proxied: rootRec.Proxied,
+		})
+		if err != nil {
+			return fmt.Errorf("failed updating %s: %w", rootName, err)
+		}
+		sendTelegramMessage(fmt.Sprintf("IP for %s updated to %s", rootName, currentIP))
+	}
+
+	// Update wildcard if needed
+	if wildcardRec.Content == currentIP {
+		fmt.Printf("%s already up to date (%s)\n", wildcardName, currentIP)
+	} else {
+		fmt.Printf("Updating %s from %s to %s\n", wildcardName, wildcardRec.Content, currentIP)
+		_, err = api.UpdateDNSRecord(ctx, rc, cloudflare.UpdateDNSRecordParams{
+			ID:      wildcardRec.ID,
+			Type:    "A",
+			Name:    wildcardName,
+			Content: currentIP,
+			TTL:     wildcardRec.TTL,
+			Proxied: wildcardRec.Proxied,
+		})
+		if err != nil {
+			return fmt.Errorf("failed updating %s: %w", wildcardName, err)
+		}
+		sendTelegramMessage(fmt.Sprintf("IP for %s updated to %s", wildcardName, currentIP))
+	}
+
+	fmt.Printf("Finished %s in %s\n", domain, time.Since(start).Truncate(time.Millisecond))
+	return nil
+}
+
+func parseDomains() []string {
+	// DOMAINS can be a comma or space separated list. Falls back to DOMAIN or legacy default.
+	domainsVar := os.Getenv("DOMAINS")
+	if domainsVar == "" {
+		single := os.Getenv("DOMAIN")
+		if single != "" {
+			return []string{strings.TrimSpace(single)}
+		}
+		// Legacy default
+		return []string{"plosca.ru"}
+	}
+	// Replace common separators with comma then split
+	cleaned := strings.NewReplacer("\n", ",", " ", ",", ";", ",", "|", ",").Replace(domainsVar)
+	parts := strings.Split(cleaned, ",")
+	var domains []string
+	for _, p := range parts {
+		d := strings.TrimSpace(p)
+		if d != "" {
+			domains = append(domains, d)
+		}
+	}
+	if len(domains) == 0 {
+		domains = []string{"plosca.ru"}
+	}
+	return domains
+}
+
 func main() {
-	// 1. Get your current public IP.
+	// 1. Determine current public IP.
 	resp, err := http.Get("http://ipinfo.io/ip")
 	if err != nil {
 		log.Fatalf("Failed to get current IP: %v", err)
 	}
 	defer resp.Body.Close()
-
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		log.Fatalf("Failed to read IP response: %v", err)
@@ -56,113 +164,28 @@ func main() {
 	currentIP := strings.TrimSpace(string(body))
 	fmt.Printf("Current IP: %s\n", currentIP)
 
-	// 2. Fetch Cloudflare credentials from environment variables.
+	// 2. Cloudflare credentials
 	cloudflareEmail := getEnv("CLOUDFLARE_EMAIL")
 	cloudflareAPIKey := getEnv("CLOUDFLARE_API_KEY")
-	// Optionally, if you want to use an API token instead, set CLOUDFLARE_API_TOKEN and adjust accordingly.
-	// cloudflareAPIToken := getEnv("CLOUDFLARE_API_TOKEN")
-
-	// Create a Cloudflare API client using API key and email.
 	api, err := cloudflare.New(cloudflareAPIKey, cloudflareEmail)
 	if err != nil {
 		log.Fatalf("Failed to create Cloudflare API client: %v", err)
 	}
-	// Alternatively, to use an API token:
-	// api, err := cloudflare.NewWithAPIToken(cloudflareAPIToken)
-	// if err != nil {
-	//     log.Fatalf("Failed to create Cloudflare API client with token: %v", err)
-	// }
-
 	ctx := context.Background()
 
-	// 3. List zones.
-	zones, err := api.ListZones(ctx)
-	if err != nil {
-		log.Fatalf("Error listing zones: %v", err)
-	}
-	var zoneID string
-	for _, zone := range zones {
-		// Adjust the selection logic if you have multiple zones.
-		zoneID = zone.ID // This example simply uses the last zone found.
-	}
-	if zoneID == "" {
-		log.Fatalf("No zones found")
-	}
+	// 3. Domains list
+	domains := parseDomains()
+	fmt.Printf("Processing domains: %s\n", strings.Join(domains, ", "))
 
-	// Create a resource container for the zone.
-	rc := &cloudflare.ResourceContainer{
-		Identifier: zoneID,
-		Type:       "zone",
-	}
-
-	// 4. Define your domain and its wildcard.
-	// These can also be parameterized or set via environment variables if needed.
-	domain := "plosca.ru"
-	wildcard := "*." + domain
-
-	// 5. Retrieve DNS records for the zone.
-	params := cloudflare.ListDNSRecordsParams{} // empty search parameters
-	recs, _, err := api.ListDNSRecords(ctx, rc, params)
-	if err != nil {
-		log.Fatalf("Error fetching DNS records: %v", err)
-	}
-	var domainRec *cloudflare.DNSRecord
-	var wildcardRec *cloudflare.DNSRecord
-	for _, rec := range recs {
-		if rec.Name == domain && rec.Type == "A" {
-			domainRec = &rec
-		} else if rec.Name == wildcard && rec.Type == "A" {
-			wildcardRec = &rec
+	var hadError bool
+	for _, domain := range domains {
+		if err := updateDomain(ctx, api, currentIP, domain); err != nil {
+			hadError = true
+			log.Printf("Error updating %s: %v", domain, err)
+			sendTelegramMessage(fmt.Sprintf("Error updating %s: %v", domain, err))
 		}
 	}
-	if domainRec == nil {
-		log.Fatalf("A record for %s not found", domain)
-	}
-	if wildcardRec == nil {
-		log.Fatalf("A record for %s not found", wildcard)
-	}
-
-	// 6. Update the domain record if needed.
-	if domainRec.Content == currentIP {
-		fmt.Printf("%s is already up to date\n", domain)
-		// Uncomment to notify even when no changes occur:
-		// sendTelegramMessage("No IP changes for " + domain)
-	} else {
-		fmt.Printf("Updating %s from %s to %s\n", domain, domainRec.Content, currentIP)
-		updateParams := cloudflare.UpdateDNSRecordParams{
-			ID:      domainRec.ID,
-			Type:    "A",
-			Name:    domain,
-			Content: currentIP,
-			TTL:     domainRec.TTL,
-			Proxied: domainRec.Proxied,
-		}
-		_, err = api.UpdateDNSRecord(ctx, rc, updateParams)
-		if err != nil {
-			log.Fatalf("Failed to update DNS record for %s: %v", domain, err)
-		}
-		sendTelegramMessage(fmt.Sprintf("IP for %s updated to %s", domain, currentIP))
-	}
-
-	// 7. Update the wildcard record if needed.
-	if wildcardRec.Content == currentIP {
-		fmt.Printf("%s is already up to date\n", wildcard)
-		// Uncomment to notify even when no changes occur:
-		// sendTelegramMessage(fmt.Sprintf("%s is already up to date", wildcard))
-	} else {
-		fmt.Printf("Updating %s from %s to %s\n", wildcard, wildcardRec.Content, currentIP)
-		updateParams := cloudflare.UpdateDNSRecordParams{
-			ID:      wildcardRec.ID,
-			Type:    "A",
-			Name:    wildcard,
-			Content: currentIP,
-			TTL:     wildcardRec.TTL,
-			Proxied: wildcardRec.Proxied,
-		}
-		_, err = api.UpdateDNSRecord(ctx, rc, updateParams)
-		if err != nil {
-			log.Fatalf("Failed to update DNS record for %s: %v", wildcard, err)
-		}
-		sendTelegramMessage(fmt.Sprintf("IP for %s updated to %s", wildcard, currentIP))
+	if hadError {
+		log.Fatal("One or more domains failed to update")
 	}
 }
